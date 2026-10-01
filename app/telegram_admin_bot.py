@@ -16,6 +16,7 @@ from backup import run_backup
 from health_state import write_status
 from logging_config import setup_logging
 from state_store import ConcurrentRunError, StateStore
+from workflow_status import payment_is_automatic
 
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -236,8 +237,17 @@ class TelegramAdminBot:
             return
         amount = item.get("amount") if kind == "p" else item.get("refund_amount")
         status = item.get("status", "unknown")
-        automatic_statuses = {"ready", "cancelled"}
-        mode = "автоматический повтор" if status in automatic_statuses else "нужна ручная проверка"
+        if kind == "p" and status in {"creating", "unknown"}:
+            mode = "автоматическая сверка в ФНС"
+        elif kind == "p" and payment_is_automatic(status):
+            mode = "автоматический повтор отправки"
+        elif kind == "r" and status in {
+            "ready", "cancelled", "cancellation_unknown",
+            "replacement_unknown", "creating_replacement",
+        }:
+            mode = "автоматическая обработка"
+        else:
+            mode = "нужна ручная проверка"
         lines = [
             "💳 <b>Платёж</b>" if kind == "p" else "↩️ <b>Возврат</b>",
             f"ID: <code>{html.escape(str(item_id))}</code>",
@@ -245,10 +255,27 @@ class TelegramAdminBot:
             f"Дата: <code>{html.escape(str(item.get('created_at', '—')))}</code>",
             f"Статус: <code>{html.escape(status)}</code>",
             f"Режим: {mode}",
-            f"Попыток: {item.get('queue_attempts', item.get('attempts', 0))}",
-            f"Последняя попытка: <code>{html.escape(str(item.get('last_attempt_at', '—')))}</code>",
+            "Повторных отправок из очереди: "
+            f"{item.get('queue_attempts', 0)}",
+            "Последний запуск обработки: "
+            f"<code>{html.escape(str(item.get('last_attempt_at', '—')))}</code>",
             f"Ошибка: <code>{html.escape(str(item.get('error', '—'))[:700])}</code>",
         ]
+        if kind == "p" and status in {"creating", "unknown"}:
+            lines.extend([
+                f"Проверок в ФНС: {item.get('verification_attempts', 0)}",
+                "Успешных проверок без чека: "
+                f"{item.get('unknown_negative_checks', 0)} из "
+                f"{config.FNS_UNKNOWN_CHECKS_BEFORE_RETRY}",
+                "Последняя проверка: "
+                f"<code>{html.escape(str(item.get('last_verification_at', '—')))}</code>",
+                "Следующая проверка: "
+                f"<code>{html.escape(str(item.get('next_unknown_verification_at', '—')))}</code>",
+                "Расписание проверки: "
+                f"<code>{html.escape(config.FNS_RETRY_SCHEDULE)}</code>",
+                "Сервис сам ищет уже созданный чек и не регистрирует доход "
+                "повторно вслепую.",
+            ])
         buttons = []
         retryable = kind == "p" or status in {
             "cancellation_unknown", "cancellation_rejected",
@@ -345,11 +372,12 @@ class TelegramAdminBot:
             1 for item in receipt_deliveries
             if item.get("status") == "undeliverable"
         )
-        ready = sum(
+        automatic = sum(
             1 for item in pending_payments
-            if isinstance(item, dict) and item.get("status") == "ready"
+            if isinstance(item, dict)
+            and payment_is_automatic(item.get("status"))
         )
-        manual = len(pending_payments) - ready
+        manual = len(pending_payments) - automatic
         maximum = config.FNS_QUEUE_MAX_ATTEMPTS
         limit_text = str(maximum) if maximum else "без ограничений"
         backup_text = "отключены"
@@ -366,7 +394,7 @@ class TelegramAdminBot:
         await self.send(
             "📊 <b>Состояние сервиса</b>\n\n"
             f"Платежей в очереди: <b>{len(pending_payments)}</b>\n"
-            f"— автоматический повтор: <b>{ready}</b>\n"
+            f"— автоматическая обработка: <b>{automatic}</b>\n"
             f"— ручная проверка: <b>{manual}</b>\n"
             f"Неоплаченных под наблюдением: <b>{len(watched_payments)}</b>\n"
             "Обработка возвратов: "

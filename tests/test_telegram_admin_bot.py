@@ -142,6 +142,52 @@ class TelegramAdminBotTests(unittest.TestCase):
         item = self.bot.store.load()["pending_refunds"][0]
         self.assertEqual("cancelled", item["status"])
 
+    def test_unknown_payment_is_shown_as_automatic_fns_reconciliation(self):
+        self.bot.store.save({
+            "pending_payments": [{
+                "payment_id": "payment-unknown",
+                "amount": "139.00",
+                "created_at": "2026-10-01T11:41:53Z",
+                "status": "unknown",
+                "queue_attempts": 0,
+                "verification_attempts": 3,
+                "unknown_negative_checks": 2,
+                "last_verification_at": "2026-10-01T14:00:00Z",
+                "next_unknown_verification_at": "2026-10-01T14:30:00Z",
+                "error": "ФНС не ответила вовремя",
+            }],
+            "pending_refunds": [],
+        })
+
+        with patch.object(
+            bot_module.config, "FNS_RETRY_SCHEDULE", "*/5 * * * *"
+        ):
+            asyncio.run(self.bot.show_queue_item("p", "payment-unknown"))
+
+        message = self.bot.send.await_args.args[0]
+        self.assertIn("автоматическая сверка в ФНС", message)
+        self.assertIn("Проверок в ФНС: 3", message)
+        self.assertIn("Успешных проверок без чека: 2 из 5", message)
+        self.assertIn("2026-10-01T14:30:00Z", message)
+        self.assertIn("*/5 * * * *", message)
+        self.assertNotIn("нужна ручная проверка", message)
+
+    def test_status_counts_unknown_payment_as_automatic(self):
+        self.bot.store.save({
+            "pending_payments": [{"status": "unknown"}],
+            "pending_refunds": [],
+            "watched_payments": [],
+            "receipt_deliveries": [],
+            "notification_preferences": {},
+            "receipt_reports": {},
+        })
+
+        asyncio.run(self.bot.command_status())
+
+        message = self.bot.send.await_args.args[0]
+        self.assertIn("автоматическая обработка: <b>1</b>", message)
+        self.assertIn("ручная проверка: <b>0</b>", message)
+
     def test_start_cancels_report_id_input(self):
         self.bot.pending_input = "report_chat_id"
         self.bot.pending_input_deadline = None

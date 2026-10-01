@@ -38,6 +38,25 @@ class SyncStartConfigTests(unittest.TestCase):
             ):
                 config.validate_config()
 
+    def test_fns_response_timeout_must_be_positive(self):
+        with patch.object(config, "FNS_RESPONSE_TIMEOUT_SECONDS", 0):
+            with self.assertRaisesRegex(
+                ValueError, "FNS_RESPONSE_TIMEOUT_SECONDS"
+            ):
+                config.validate_config()
+
+    def test_unknown_check_settings_must_be_positive(self):
+        with patch.object(config, "FNS_UNKNOWN_CHECK_INTERVAL_MINUTES", 0):
+            with self.assertRaisesRegex(
+                ValueError, "FNS_UNKNOWN_CHECK_INTERVAL_MINUTES"
+            ):
+                config.validate_config()
+        with patch.object(config, "FNS_UNKNOWN_CHECKS_BEFORE_RETRY", 0):
+            with self.assertRaisesRegex(
+                ValueError, "FNS_UNKNOWN_CHECKS_BEFORE_RETRY"
+            ):
+                config.validate_config()
+
     def test_payment_id_prefix_rejects_unsafe_characters(self):
         with patch.object(config, "PAYMENT_ID_PREFIX", "payment prefix"):
             with self.assertRaisesRegex(ValueError, "PAYMENT_ID_PREFIX"):

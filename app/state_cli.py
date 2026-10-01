@@ -35,7 +35,7 @@ def list_pending_payments(store):
     state = store.load() or {}
     pending = state.get("pending_payments", [])
     if not pending:
-        print("Платежей для ручной сверки нет.")
+        print("Платежей в очереди ФНС нет.")
         return 0
     for item in pending:
         if isinstance(item, str):

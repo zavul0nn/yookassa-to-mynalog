@@ -63,6 +63,7 @@ class FakeNalog:
         self.cancel_calls = []
         self.add_calls = []
         self.find_calls = []
+        self.status_calls = []
 
     async def add_income(self, description, amount, payment_date):
         self.add_calls.append((description, Decimal(str(amount)), payment_date))
@@ -74,9 +75,12 @@ class FakeNalog:
 
     async def find_income(self, description, amount, operation_date=None):
         self.find_calls.append((description, Decimal(str(amount)), operation_date))
+        self.last_error = None
+        self.last_error_retryable = False
         return self.found_receipts.get(description)
 
     async def get_income_status(self, receipt_uuid, operation_date=None):
+        self.status_calls.append((receipt_uuid, operation_date))
         return self.income_status
 
     async def cancel_income(self, receipt_uuid):
@@ -495,7 +499,114 @@ class CheckpointTests(unittest.TestCase):
         asyncio.run(manager.sync())
 
         self.assertEqual(first_call_count, len(nalog.add_calls))
-        self.assertEqual("unknown", manager.state["pending_payments"][0]["status"])
+        workflow = manager.state["pending_payments"][0]
+        self.assertEqual("unknown", workflow["status"])
+        self.assertEqual(1, workflow["verification_attempts"])
+        self.assertEqual(0, workflow["unknown_negative_checks"])
+        self.assertIn("last_verification_at", workflow)
+        self.assertIn("next_unknown_verification_at", workflow)
+
+    def test_unknown_payment_is_counted_as_automatic_reconciliation(self):
+        manager = manager_with([], [], FakeNalog())
+        manager.state["pending_payments"] = [{
+            "payment_id": "unknown-payment",
+            "amount": "100.00",
+            "currency": "RUB",
+            "created_at": "2026-01-02T00:00:00Z",
+            "description": "unknown-payment",
+            "status": "unknown",
+            "next_unknown_verification_at": "2020-01-01T00:00:00+00:00",
+        }]
+
+        completed, manual = asyncio.run(manager._resume_pending_payments())
+
+        self.assertEqual([], completed)
+        self.assertEqual(0, manual)
+        workflow = manager.state["pending_payments"][0]
+        self.assertEqual(1, workflow["verification_attempts"])
+        self.assertEqual(1, workflow["unknown_negative_checks"])
+
+    def test_unknown_payment_requeues_only_after_five_checks_and_control(self):
+        nalog = FakeNalog()
+        manager = manager_with([], [], nalog)
+        manager.state["receipt_map"]["control-payment"] = "control-receipt"
+        manager.state["payment_event_times"]["control-payment"] = (
+            "2026-01-01T00:00:00Z"
+        )
+        manager.state["pending_payments"] = [{
+            "payment_id": "unknown-payment",
+            "amount": "100.00",
+            "currency": "RUB",
+            "created_at": "2026-01-02T00:00:00Z",
+            "description": "unknown-payment",
+            "status": "unknown",
+            "unknown_negative_checks": 0,
+        }]
+
+        for expected_checks in range(1, 6):
+            workflow = manager.state["pending_payments"][0]
+            workflow["next_unknown_verification_at"] = (
+                "2020-01-01T00:00:00+00:00"
+            )
+            asyncio.run(manager._resume_pending_payments())
+            self.assertEqual(expected_checks, workflow["unknown_negative_checks"])
+            expected_status = "ready" if expected_checks == 5 else "unknown"
+            self.assertEqual(expected_status, workflow["status"])
+
+        self.assertEqual([], nalog.add_calls)
+        self.assertEqual(5, len(nalog.find_calls))
+        self.assertEqual("control-receipt", nalog.status_calls[0][0])
+
+    def test_unknown_errors_do_not_count_as_negative_checks(self):
+        nalog = FakeNalog()
+
+        async def failed_lookup(description, amount, operation_date=None):
+            nalog.find_calls.append((description, amount, operation_date))
+            nalog.last_error = "ФНС не ответила вовремя"
+            nalog.last_error_retryable = True
+            return None
+
+        nalog.find_income = failed_lookup
+        manager = manager_with([], [], nalog)
+        manager.state["pending_payments"] = [{
+            "payment_id": "unknown-payment",
+            "amount": "100.00",
+            "currency": "RUB",
+            "created_at": "2026-01-02T00:00:00Z",
+            "description": "unknown-payment",
+            "status": "unknown",
+            "unknown_negative_checks": 2,
+            "next_unknown_verification_at": "2020-01-01T00:00:00+00:00",
+        }]
+
+        asyncio.run(manager._resume_pending_payments())
+
+        workflow = manager.state["pending_payments"][0]
+        self.assertEqual(2, workflow["unknown_negative_checks"])
+        self.assertEqual("unknown", workflow["status"])
+
+    def test_unknown_payment_is_not_requeued_without_control_receipt(self):
+        manager = manager_with([], [], FakeNalog())
+        manager.state["receipt_map"] = {}
+        manager.state["payment_event_times"] = {}
+        manager.state["pending_payments"] = [{
+            "payment_id": "unknown-payment",
+            "amount": "100.00",
+            "currency": "RUB",
+            "created_at": "2026-01-02T00:00:00Z",
+            "description": "unknown-payment",
+            "status": "unknown",
+            "unknown_negative_checks": 4,
+            "next_unknown_verification_at": "2020-01-01T00:00:00+00:00",
+        }]
+
+        asyncio.run(manager._resume_pending_payments())
+
+        workflow = manager.state["pending_payments"][0]
+        self.assertEqual("unknown", workflow["status"])
+        self.assertEqual(5, workflow["unknown_negative_checks"])
+        self.assertEqual([], manager.nalog.add_calls)
+        self.assertIn("контрольного чека", workflow["error"])
 
     def test_payment_retries_next_run_when_request_was_not_sent(self):
         nalog = FakeNalog(failed_payment_ids={"outage"})

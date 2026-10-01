@@ -20,6 +20,7 @@ from customer_receipt_delivery import (
     CustomerReceiptDelivery,
     extract_telegram_user_id,
 )
+from workflow_status import payment_is_automatic
 
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 DATA_DIR = os.getenv("DATA_DIR", "data")
@@ -583,6 +584,7 @@ class SyncManager:
             "status": "ready" if currency == "RUB" else "unsupported_currency",
             "attempts": 0,
             "queue_attempts": 0,
+            "verification_attempts": 0,
         }
         self.state["pending_payments"].append(workflow)
         self.save_state()
@@ -606,6 +608,9 @@ class SyncManager:
         payment_date = datetime.fromisoformat(
             workflow["created_at"].replace('Z', '+00:00')
         )
+        if status == "unknown" and not self._unknown_check_is_due(workflow):
+            return "waiting", None
+
         workflow["attempts"] = int(workflow.get("attempts", 0)) + 1
         workflow["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
         if status == "ready" and queue_attempt:
@@ -656,6 +661,14 @@ class SyncManager:
                 queue_attempt=queue_attempt,
             )
 
+        workflow["verification_attempts"] = int(
+            workflow.get("verification_attempts", 0)
+        ) + 1
+        workflow["last_verification_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        self.save_state()
+
         receipt_uuid = await self.nalog.find_income(
             workflow["description"],
             amount,
@@ -664,6 +677,57 @@ class SyncManager:
         if receipt_uuid:
             self._complete_payment_workflow(workflow, receipt_uuid)
             return "completed", amount
+
+        lookup_succeeded = self.nalog.last_error is None
+        if status == "unknown" and lookup_succeeded:
+            negative_checks = min(
+                int(workflow.get("unknown_negative_checks", 0)) + 1,
+                config.FNS_UNKNOWN_CHECKS_BEFORE_RETRY,
+            )
+            workflow["unknown_negative_checks"] = negative_checks
+            workflow["error"] = (
+                "Чек пока не найден; выполняется автоматическая сверка."
+            )
+            workflow["last_error_retryable"] = False
+
+            if negative_checks >= config.FNS_UNKNOWN_CHECKS_BEFORE_RETRY:
+                control = await self._verify_known_control_receipt(workflow)
+                if control:
+                    workflow["status"] = "ready"
+                    workflow["unknown_requeued_at"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    workflow["error"] = (
+                        f"После {negative_checks} успешных сверок чек не найден; "
+                        f"контрольный чек {control} доступен. Платёж возвращён "
+                        "в очередь на регистрацию."
+                    )
+                    workflow["last_error_retryable"] = False
+                    workflow.pop("next_unknown_verification_at", None)
+                    self.save_state()
+                    logging.warning(
+                        "Платёж %s возвращён в очередь: чек не найден после "
+                        "%s успешных сверок, контрольный чек %s доступен.",
+                        workflow.get("payment_id", "unknown"),
+                        negative_checks,
+                        control,
+                    )
+                    return "waiting", None
+
+            self._schedule_next_unknown_check(workflow)
+            self.save_state()
+            logging.info(
+                "Платёж %s: чек не найден при успешной сверке %s из %s; "
+                "следующая проверка не раньше %s.",
+                workflow.get("payment_id", "unknown"),
+                negative_checks,
+                config.FNS_UNKNOWN_CHECKS_BEFORE_RETRY,
+                workflow["next_unknown_verification_at"],
+            )
+            return "waiting", None
+
+        if status == "unknown":
+            self._schedule_next_unknown_check(workflow)
 
         return self._defer_payment_workflow(
             workflow,
@@ -676,10 +740,17 @@ class SyncManager:
     def _defer_payment_workflow(
         self, workflow, error, retryable, *, uncertain, queue_attempt
     ):
+        was_unknown = workflow.get("status") == "unknown"
         workflow["error"] = error
         workflow["last_error_retryable"] = bool(retryable)
         if uncertain:
             workflow["status"] = "unknown"
+            if not was_unknown:
+                workflow["unknown_negative_checks"] = 0
+                workflow["unknown_since"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                self._schedule_next_unknown_check(workflow)
         elif retryable:
             workflow["status"] = "ready"
         else:
@@ -698,6 +769,96 @@ class SyncManager:
             )
         self.save_state()
         return "manual", None
+
+    def _schedule_next_unknown_check(self, workflow):
+        workflow["next_unknown_verification_at"] = (
+            datetime.now(timezone.utc)
+            + timedelta(minutes=config.FNS_UNKNOWN_CHECK_INTERVAL_MINUTES)
+        ).isoformat()
+
+    def _unknown_check_is_due(self, workflow):
+        next_check = workflow.get("next_unknown_verification_at")
+        if not next_check:
+            workflow.setdefault(
+                "unknown_since", datetime.now(timezone.utc).isoformat()
+            )
+            workflow.setdefault("unknown_negative_checks", 0)
+            self._schedule_next_unknown_check(workflow)
+            self.save_state()
+            return False
+        try:
+            due_at = datetime.fromisoformat(next_check.replace("Z", "+00:00"))
+            if due_at.tzinfo is None:
+                due_at = due_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            self._schedule_next_unknown_check(workflow)
+            self.save_state()
+            return False
+        return datetime.now(timezone.utc) >= due_at.astimezone(timezone.utc)
+
+    async def _verify_known_control_receipt(self, workflow):
+        """Подтвердить, что ФНС действительно возвращает известные чеки."""
+        current_payment_id = workflow.get("payment_id")
+        receipt_map = self.state.get("receipt_map", {})
+        event_times = self.state.get("payment_event_times", {})
+        try:
+            target_date = datetime.fromisoformat(
+                workflow["created_at"].replace("Z", "+00:00")
+            )
+            if target_date.tzinfo is None:
+                target_date = target_date.replace(tzinfo=timezone.utc)
+        except (KeyError, AttributeError, TypeError, ValueError):
+            target_date = datetime.now(timezone.utc)
+        candidates = []
+        for payment_id, receipt_uuid in receipt_map.items():
+            created_at = event_times.get(payment_id)
+            if (
+                payment_id == current_payment_id
+                or not receipt_uuid
+                or not created_at
+            ):
+                continue
+            try:
+                operation_date = datetime.fromisoformat(
+                    created_at.replace("Z", "+00:00")
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if operation_date.tzinfo is None:
+                operation_date = operation_date.replace(tzinfo=timezone.utc)
+            candidates.append((operation_date, receipt_uuid))
+
+        candidates.sort(
+            key=lambda item: abs((item[0] - target_date).total_seconds())
+        )
+        for operation_date, receipt_uuid in candidates[:3]:
+            receipt_status = await self.nalog.get_income_status(
+                receipt_uuid, operation_date
+            )
+            if receipt_status in {"active", "cancelled"}:
+                return receipt_uuid
+            if receipt_status == "error":
+                workflow["error"] = (
+                    "Контрольный чек не удалось проверить; автоматическая "
+                    "повторная регистрация отложена."
+                )
+                logging.warning(
+                    "Контрольный чек %s не удалось проверить: %s",
+                    receipt_uuid,
+                    self.nalog.last_error or "нет деталей",
+                )
+                return None
+
+        workflow["error"] = (
+            "ФНС не вернула ни одного контрольного чека; автоматическая "
+            "повторная регистрация отложена."
+        )
+        logging.warning(
+            "Контрольная сверка для платежа %s не подтверждена: "
+            "известные чеки не найдены.",
+            current_payment_id or "unknown",
+        )
+        return None
 
     def _complete_payment_workflow(self, workflow, receipt_uuid):
         payment_id = workflow["payment_id"]
@@ -858,8 +1019,14 @@ class SyncManager:
                         workflow.get("payment_id", "unknown"),
                         reason,
                     )
+            elif result == "waiting":
+                continue
             else:
-                manual += 1
+                if not (
+                    isinstance(workflow, dict)
+                    and payment_is_automatic(workflow.get("status"))
+                ):
+                    manual += 1
                 if isinstance(workflow, dict):
                     error = workflow.get("error")
                     signature = f"{workflow.get('status')}:{error}"
@@ -1240,12 +1407,14 @@ class SyncManager:
                 sync_ok = False
                 automatic = sum(
                     1 for item in pending
-                    if isinstance(item, dict) and item.get("status") == "ready"
+                    if isinstance(item, dict)
+                    and payment_is_automatic(item.get("status"))
                 )
                 manual = len(pending) - automatic
                 if automatic:
                     logging.warning(
-                        f"⚠ Платежей, ожидающих автоматического повтора: {automatic}"
+                        "⚠ Платежей в автоматической обработке: "
+                        f"{automatic}"
                     )
                 if manual:
                     logging.warning(
@@ -1600,6 +1769,12 @@ def print_banner():
         ("Авторизация", config.MOY_NALOG_AUTH_METHOD),
         ("Расписание", config.CRON_SCHEDULE),
         ("Повторы ФНС", config.FNS_RETRY_SCHEDULE),
+        ("Таймаут ФНС", f"{config.FNS_RESPONSE_TIMEOUT_SECONDS:g} сек."),
+        (
+            "Сверка unknown",
+            f"{config.FNS_UNKNOWN_CHECKS_BEFORE_RETRY} × "
+            f"{config.FNS_UNKNOWN_CHECK_INTERVAL_MINUTES} мин.",
+        ),
         (
             "Возвраты",
             colorize("✓ включены", "green")

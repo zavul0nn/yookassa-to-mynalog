@@ -66,7 +66,13 @@ class MoyNalogAPI:
             'Sec-Fetch-Site': 'same-origin'
         }
 
-        self.client = httpx.AsyncClient(headers=self.headers, timeout=30.0)
+        self.client = httpx.AsyncClient(
+            headers=self.headers,
+            timeout=httpx.Timeout(
+                config.FNS_RESPONSE_TIMEOUT_SECONDS,
+                connect=min(15.0, config.FNS_RESPONSE_TIMEOUT_SECONDS),
+            ),
+        )
 
     def _reset_error(self):
         self.last_error = None
@@ -501,6 +507,9 @@ class MoyNalogAPI:
                     for item in incomes
                 )
                 if page_marker in seen_pages:
+                    self.last_error = "ФНС повторила страницу списка чеков"
+                    self.last_error_kind = "bad_response"
+                    self.last_error_retryable = True
                     logging.warning(
                         "ФНС повторила страницу списка чеков; поиск остановлен."
                     )
@@ -531,6 +540,9 @@ class MoyNalogAPI:
                 if len(incomes) < params["limit"]:
                     return None
                 params["offset"] += params["limit"]
+            self.last_error = "достигнут предел страниц при поиске чека"
+            self.last_error_kind = "bad_response"
+            self.last_error_retryable = True
             logging.warning("Достигнут предел страниц при поиске чека в ФНС.")
         except Exception as e:
             if self.last_error is None:

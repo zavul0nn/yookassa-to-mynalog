@@ -13,6 +13,7 @@ from tenacity import wait_none
 APP_DIR = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP_DIR))
 
+import config
 from nalog_api import MoyNalogAPI
 
 
@@ -116,6 +117,16 @@ class NalogMoneyTests(unittest.TestCase):
         api.headers = {}
         api.client = FakeClient(outcome)
         return api
+
+    def test_client_uses_configured_fns_response_timeout(self):
+        with patch.object(config, "DEVICE_ID", "test-device"), patch.object(
+            config, "FNS_RESPONSE_TIMEOUT_SECONDS", 90
+        ), patch("nalog_api.httpx.AsyncClient") as client_class:
+            MoyNalogAPI("login", "password")
+
+        timeout = client_class.call_args.kwargs["timeout"]
+        self.assertEqual(90, timeout.read)
+        self.assertEqual(15, timeout.connect)
 
     def create_auth_api(self, outcome):
         api = self.create_api()
@@ -236,6 +247,31 @@ class NalogMoneyTests(unittest.TestCase):
 
         self.assertEqual("wanted-receipt", result)
         self.assertEqual([0, 50], api.client.offsets)
+
+    def test_repeated_receipt_page_is_not_treated_as_complete_lookup(self):
+        full_page = [
+            {
+                "approvedReceiptUuid": f"other-{index}",
+                "name": "Другая услуга",
+                "totalAmount": "10.10",
+            }
+            for index in range(50)
+        ]
+        api = self.create_api()
+        api.client = PagedFakeClient([
+            FakeResponse(200, {"content": full_page}),
+            FakeResponse(200, {"content": full_page}),
+        ])
+
+        result = asyncio.run(api.find_income(
+            "Услуга [yookassa:payment-1]",
+            Decimal("10.10"),
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ))
+
+        self.assertIsNone(result)
+        self.assertEqual("bad_response", api.last_error_kind)
+        self.assertTrue(api.last_error_retryable)
 
     def test_receipt_status_distinguishes_cancelled_income(self):
         api = self.create_api()

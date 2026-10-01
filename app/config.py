@@ -33,6 +33,15 @@ CRON_SCHEDULE = os.getenv("CRON_SCHEDULE", "0 */4 * * *")
 FNS_RETRY_SCHEDULE = os.getenv("FNS_RETRY_SCHEDULE", "*/5 * * * *")
 FNS_RETRY_DELAY_SECONDS = float(os.getenv("FNS_RETRY_DELAY_SECONDS", "3"))
 FNS_QUEUE_MAX_ATTEMPTS = int(os.getenv("FNS_QUEUE_MAX_ATTEMPTS", "0"))
+FNS_RESPONSE_TIMEOUT_SECONDS = float(
+    os.getenv("FNS_RESPONSE_TIMEOUT_SECONDS", "60")
+)
+FNS_UNKNOWN_CHECK_INTERVAL_MINUTES = int(
+    os.getenv("FNS_UNKNOWN_CHECK_INTERVAL_MINUTES", "30")
+)
+FNS_UNKNOWN_CHECKS_BEFORE_RETRY = int(
+    os.getenv("FNS_UNKNOWN_CHECKS_BEFORE_RETRY", "5")
+)
 PENDING_PAYMENT_WATCH_MINUTES = int(
     os.getenv("PENDING_PAYMENT_WATCH_MINUTES", "60")
 )
@@ -124,6 +133,18 @@ def validate_config():
         raise ValueError("FNS_RETRY_DELAY_SECONDS не может быть отрицательным.")
     if FNS_QUEUE_MAX_ATTEMPTS < 0:
         raise ValueError("FNS_QUEUE_MAX_ATTEMPTS не может быть отрицательным.")
+    if FNS_RESPONSE_TIMEOUT_SECONDS <= 0:
+        raise ValueError(
+            "FNS_RESPONSE_TIMEOUT_SECONDS должен быть положительным."
+        )
+    if FNS_UNKNOWN_CHECK_INTERVAL_MINUTES < 1:
+        raise ValueError(
+            "FNS_UNKNOWN_CHECK_INTERVAL_MINUTES должен быть не меньше 1."
+        )
+    if FNS_UNKNOWN_CHECKS_BEFORE_RETRY < 1:
+        raise ValueError(
+            "FNS_UNKNOWN_CHECKS_BEFORE_RETRY должен быть не меньше 1."
+        )
     if PENDING_PAYMENT_WATCH_MINUTES < 1:
         raise ValueError(
             "PENDING_PAYMENT_WATCH_MINUTES должен быть положительным числом."
